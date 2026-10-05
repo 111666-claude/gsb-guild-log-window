@@ -1,9 +1,6 @@
-"""公会操作日志：时间窗口、条数上限与幂等去重，查询用生成器惰性产出。
+"""公会操作日志：时间窗口、条数上限与幂等去重，查询用生成器惰性产出。"""
 
-缺陷：字段不校验、同一个 event_id 重复记、条数上限不生效、窗口不裁、
-产出顺序按插入而不是时间、每次查询全扫日志。
-"""
-
+from bisect import bisect_left
 from dataclasses import dataclass
 
 
@@ -28,14 +25,47 @@ class Window:
         self.entries = []
         self.invalid = 0
         self.scanned = 0
+        self._seen = set()
+        self._order = []
+
+    def _valid(self, entry):
+        return (
+            isinstance(entry.event_id, str)
+            and entry.event_id != ""
+            and isinstance(entry.actor, str)
+            and entry.actor != ""
+            and isinstance(entry.target, str)
+            and entry.target != ""
+            and isinstance(entry.action, str)
+            and len(entry.action) >= self.min_action_len
+        )
 
     def add(self, entry):
-        """记一条日志。缺陷：不校验字段、不查 event_id、不剪上限。"""
-        self.entries.append(entry)
+        """校验字段并按 event_id 去重后入账，超出 limit 时丢掉最旧的一条。"""
+        if not self._valid(entry):
+            self.invalid += 1
+            return False
+        if entry.event_id in self._seen:
+            return False
+        self._seen.add(entry.event_id)
+        key = (entry.at_ms, entry.event_id)
+        index = bisect_left(self._order, key)
+        self._order.insert(index, key)
+        self.entries.insert(index, entry)
+        if len(self.entries) > self.limit:
+            self._order.pop(0)
+            self.entries.pop(0)
         return True
 
     def recent(self, now_ms):
-        """产出窗口内的日志（生成器）。缺陷：不裁窗口、不看上限、按插入顺序、全扫。"""
-        self.scanned += len(self.entries)
-        for entry in self.entries:
+        """惰性产出 [now-window, now] 内的条目，按 at_ms 升序、同刻按 event_id。"""
+        lower = now_ms - self.window_ms
+        index = bisect_left(self._order, (lower, ""))
+        total = len(self.entries)
+        while index < total:
+            self.scanned += 1
+            entry = self.entries[index]
+            if entry.at_ms > now_ms:
+                break
             yield entry
+            index += 1
